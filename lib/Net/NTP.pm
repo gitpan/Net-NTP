@@ -1,8 +1,11 @@
 package Net::NTP;
-
-use 5.006;
+use 5.008;
 use strict;
 use warnings;
+
+use IO::Socket;
+use constant HAVE_SOCKET_INET6 => eval { require IO::Socket::INET6 };
+use Time::HiRes qw(time);
 
 require Exporter;
 
@@ -12,9 +15,9 @@ our @EXPORT = qw(
   get_ntp_response
 );
 
-our $VERSION = '1.3';
+our $VERSION = '1.4';
 
-our $TIMEOUT = 60;
+our $TIMEOUT = 5;
 
 our %MODE = (
     '0' => 'reserved',
@@ -126,9 +129,8 @@ my $unpack_ip = sub {
     return $ip;
 };
 
+
 sub get_ntp_response {
-    use IO::Socket;
-    use constant HAVE_SOCKET_INET6 => eval { require IO::Socket::INET6 };
 
     my $host = shift || 'localhost';
     my $port = shift || 'ntp';
@@ -156,21 +158,25 @@ sub get_ntp_response {
     my $client_frac_localtime = $frac2bin->($client_adj_localtime);
 
     my $ntp_msg =
-      pack("B8 C3 N10 B32", '00011011', (0) x 12, int($client_localtime), $client_frac_localtime);
+      pack("B8 C3 N10 B32", '00011011', (0) x 12, int($client_adj_localtime), $client_frac_localtime);
 
     $sock->send($ntp_msg)
       or die "send() failed: $!\n";
 
     eval {
-        local $SIG{ALRM} = sub { die "Net::NTP timed out geting NTP packet\n"; };
+        local $SIG{ALRM} = sub { die "Net::NTP timed out getting NTP packet\n"; };
         alarm($TIMEOUT);
         $sock->recv($data, 960)
           or die "recv() failed: $!\n";
         alarm(0);
     };
+    alarm 0;
 
-    if ($@) {
-        die "$@";
+    my $client_recvtime = time;
+
+    if (my $err = $@) {
+        return if $err =~ m/^Net::NTP timed out/;
+        die $err;
     }
 
     my @ntp_fields = qw/byte1 stratum poll precision/;
@@ -193,10 +199,22 @@ sub get_ntp_response {
         (sprintf("%0.4f", $tmp_pkt{disp})),
         $unpack_ip->($tmp_pkt{stratum}, $tmp_pkt{ident}),
         (($tmp_pkt{ref_time}   += $bin2frac->($tmp_pkt{ref_time_fb}))   -= NTP_ADJ),
-        (($tmp_pkt{org_time}   += $bin2frac->($tmp_pkt{org_time_fb}))),
+        (($tmp_pkt{org_time}   += $bin2frac->($tmp_pkt{org_time_fb}))   -= NTP_ADJ),
         (($tmp_pkt{recv_time}  += $bin2frac->($tmp_pkt{recv_time_fb}))  -= NTP_ADJ),
         (($tmp_pkt{trans_time} += $bin2frac->($tmp_pkt{trans_time_fb})) -= NTP_ADJ)
     );
+
+    my $dest_org   = sprintf "%0.5f", (($client_recvtime - $client_localtime));
+    my $recv_trans = sprintf "%0.5f", ($packet{'Receive Timestamp'} - $packet{'Transmit Timestamp'});
+    my $delay      = sprintf "%0.5f", ($dest_org + $recv_trans);
+
+    my $recv_org   = $packet{'Receive Timestamp'} - $client_recvtime;
+    my $trans_dest = $packet{'Transmit Timestamp'} - $client_localtime;
+    my $offset     = ($recv_org + $trans_dest) / 2;
+
+    # Calculated offset / delay
+    $packet{Offset} = $offset;
+    $packet{Delay}  = $delay;
 
     return %packet;
 }
